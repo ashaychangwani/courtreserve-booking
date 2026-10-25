@@ -277,6 +277,31 @@ export async function hasExistingReservation(
 }
 
 /**
+ * Check if a booking was cancelled for this date (user doesn't want to re-book)
+ */
+export async function hasCancelledBooking(
+  accountId: string,
+  venue: string,
+  date: string
+): Promise<boolean> {
+  log.trace('Checking for cancelled booking', { accountId, venue, date });
+
+  const cancelled = await prisma.cancelledBooking.findUnique({
+    where: {
+      accountId_venue_date: {
+        accountId,
+        venue,
+        date,
+      },
+    },
+  });
+
+  const hasCancellation = cancelled !== null;
+  log.trace('Cancelled booking check result', { accountId, venue, date, hasCancellation });
+  return hasCancellation;
+}
+
+/**
  * Record a successful reservation in the database
  */
 export async function recordReservation(
@@ -639,6 +664,17 @@ export async function fetchJobsNeedingBookings(): Promise<JobWithAccount[]> {
       const hasBooking = await hasExistingReservation(job.accountId, job.venue, targetDate);
 
       if (!hasBooking) {
+        // Check if user cancelled a booking for this date (don't re-book)
+        const wasCancelled = await hasCancelledBooking(job.accountId, job.venue, targetDate);
+        
+        if (wasCancelled) {
+          log.debug('Skipping date - user cancelled booking', {
+            jobName: job.name,
+            targetDate,
+          });
+          continue;
+        }
+
         log.debug('Job needs booking for date', {
           jobName: job.name,
           targetDate,

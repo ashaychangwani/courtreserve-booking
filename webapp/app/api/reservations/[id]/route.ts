@@ -125,6 +125,33 @@ export async function DELETE(
               })
             }
 
+            // Create cancelled booking record to prevent re-booking
+            await prisma.cancelledBooking.upsert({
+              where: {
+                accountId_venue_date: {
+                  accountId: account.id,
+                  venue: account.venue,
+                  date,
+                },
+              },
+              create: {
+                accountId: account.id,
+                venue: account.venue,
+                date,
+                reason: cancellationReason,
+              },
+              update: {
+                reason: cancellationReason,
+                cancelledAt: new Date(),
+              },
+            })
+
+            log.info('Created cancelled booking record', {
+              accountId: account.id,
+              venue: account.venue,
+              date,
+            })
+
             return NextResponse.json({
               message: 'External reservation deleted successfully',
               courtReserveCancelled: true,
@@ -219,6 +246,35 @@ export async function DELETE(
       log.info('No external ID, skipping CourtReserve cancellation');
       courtReserveWarning = 'Reservation not cancelled on CourtReserve (no external ID stored)';
     }
+
+    // Create cancelled booking record to prevent re-booking
+    await prisma.cancelledBooking.upsert({
+      where: {
+        accountId_venue_date: {
+          accountId: reservation.accountId,
+          venue: reservation.venue,
+          date: reservation.date,
+        },
+      },
+      create: {
+        accountId: reservation.accountId,
+        venue: reservation.venue,
+        date: reservation.date,
+        bookingJobId: reservation.bookingJobId,
+        reason: cancellationReason,
+      },
+      update: {
+        reason: cancellationReason,
+        cancelledAt: new Date(),
+      },
+    })
+
+    log.info('Created cancelled booking record', {
+      accountId: reservation.accountId,
+      venue: reservation.venue,
+      date: reservation.date,
+      bookingJobId: reservation.bookingJobId,
+    })
 
     // Delete from local database
     await prisma.reservation.delete({

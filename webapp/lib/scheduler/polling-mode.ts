@@ -10,6 +10,7 @@ import {
   fetchJobsNeedingBookings,
   getTargetDates,
   countExistingBookings,
+  hasCancelledBooking,
   recordReservation,
   updateJobTimestamps,
   archiveJob,
@@ -262,6 +263,16 @@ export class PollingModeHandler {
           targetDate,
           existingCount,
           maxBookingsPerDay,
+        });
+        continue;
+      }
+
+      // Check if user cancelled a booking for this date (don't re-book)
+      const wasCancelled = await hasCancelledBooking(job.accountId, job.venue, targetDate);
+      if (wasCancelled) {
+        log.info('Date was cancelled by user - skipping', {
+          jobName: job.name,
+          targetDate,
         });
         continue;
       }

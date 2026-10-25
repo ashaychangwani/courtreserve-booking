@@ -2,10 +2,10 @@
  * Noon Mode Handler - High-performance booking at 12:00 PM PST
  *
  * Optimizations:
- * - Pre-fetch court IDs 60 seconds before noon (no availability check at execution)
- * - Serial execution by priority (no double-booking risk)
- * - Try all courts per slot before moving to next slot
- * - Deferred logging (no I/O blocking during booking)
+ * - Pre-fetch court IDs and booking forms 60 seconds before noon
+ * - Worker pool (3 concurrent workers) pulls from shared task queue at noon
+ * - If one worker is stuck on a slow server response, others keep trying
+ * - First success signals all workers to stop
  */
 
 import { CourtReserveClient, generateTimeSlots, generateDurations, PreFetchedForm } from '../courtreserve';
@@ -15,6 +15,7 @@ import {
   fetchActiveJobs,
   getTargetDate,
   hasExistingReservation,
+  hasCancelledBooking,
   recordReservation,
   updateJobTimestamps,
   archiveJob,
@@ -136,6 +137,17 @@ export class NoonModeHandler {
     const alreadyBooked = await hasExistingReservation(job.accountId, job.venue, targetDate);
     if (alreadyBooked) {
       log.info('Job already has booking for target date - skipping', {
+        jobName: job.name,
+        targetDate,
+        venue: job.venue,
+      });
+      return;
+    }
+
+    // Check if user cancelled a booking for this date (don't re-book)
+    const wasCancelled = await hasCancelledBooking(job.accountId, job.venue, targetDate);
+    if (wasCancelled) {
+      log.info('User cancelled booking for target date - skipping', {
         jobName: job.name,
         targetDate,
         venue: job.venue,
@@ -384,7 +396,7 @@ export class NoonModeHandler {
       })),
     });
 
-    // Execute all jobs in parallel (but each job uses serial booking attempts)
+    // Execute all jobs in parallel (each job uses a 3-worker pool internally)
     const results = await Promise.allSettled(
       jobsList.map((prepared) => this.executeJob(prepared, lockManager))
     );
@@ -481,9 +493,11 @@ export class NoonModeHandler {
   }
 
   /**
-   * Execute a single job - Optimized serial execution with pre-fetched court IDs
-   * No availability check at noon - uses pre-fetched court IDs from prep phase
-   * Retries if booking window not yet open (up to 15 seconds)
+   * Execute a single job - Worker pool with 3 concurrent workers
+   * Workers pull from a shared task queue of pre-fetched court/slot combos.
+   * If a worker is stuck on a slow server response, others keep trying.
+   * If window is not open, each worker retries its current task (no shared index mutation).
+   * First success signals all workers to stop.
    */
   private async executeJob(
     prepared: PreparedJob,
@@ -511,34 +525,6 @@ export class NoonModeHandler {
     }
 
     try {
-      // Get first available court to use for window-open detection
-      let firstCourtId: number | null = null;
-      let firstTimeSlot: string | null = null;
-      let firstDuration: number | null = null;
-
-      for (const duration of prepared.durations) {
-        for (const timeSlot of prepared.timeSlots) {
-          const key = `${timeSlot}-${duration}`;
-          const courtIds = prepared.courtAvailability.get(key) || [];
-          if (courtIds.length > 0) {
-            firstCourtId = courtIds[0];
-            firstTimeSlot = timeSlot;
-            firstDuration = duration;
-            break;
-          }
-        }
-        if (firstCourtId) break;
-      }
-
-      if (!firstCourtId || !firstTimeSlot || !firstDuration) {
-        log.warn('No courts available in pre-fetch', { jobName: prepared.job.name });
-        return {
-          jobId: prepared.job.id,
-          status: 'no_courts',
-          attempts: [],
-        };
-      }
-
       // Helper to book with pre-fetched form or fallback to slow path
       const bookWithForm = async (
         timeSlot: string,
@@ -563,161 +549,178 @@ export class NoonModeHandler {
         }
       };
 
-      // Phase 1: Wait for booking window to open by retrying first court
-      let windowOpen = false;
-      let windowRetryCount = 0;
-      const windowStartTime = Date.now();
-
-      while (!windowOpen && (Date.now() - windowStartTime) < MAX_WINDOW_RETRY_MS) {
-        const result = await bookWithForm(firstTimeSlot, firstDuration, firstCourtId);
-
-        attempts.push({
-          date: prepared.targetDate,
-          timeSlot: firstTimeSlot,
-          duration: firstDuration,
-          courtId: firstCourtId,
-          success: result.success,
-          message: result.message || (result.success ? 'Booked successfully' : 'Booking failed'),
-          timestamp: new Date(),
-          externalId: result.externalId,
-          confirmationNumber: result.confirmationNumber,
-        });
-
-        if (result.success) {
-          // SUCCESS on first try!
-          log.info('BOOKING SUCCESS!', {
-            jobName: prepared.job.name,
-            date: prepared.targetDate,
-            timeSlot: firstTimeSlot,
-            duration: firstDuration,
-            courtId: firstCourtId,
-            totalAttempts: attempts.length,
-            windowRetries: windowRetryCount,
-            durationMs: Date.now() - jobStartTime,
-          });
-
-          await this.handleSuccessfulBooking(prepared, attempts[attempts.length - 1], result);
-
-          return {
-            jobId: prepared.job.id,
-            status: 'success',
-            attempts,
-            courtId: firstCourtId,
-            date: prepared.targetDate,
-            startTime: firstTimeSlot,
-            duration: firstDuration,
-          };
-        }
-
-        // Check if window not open
-        if (result.windowClosed || result.message?.includes('only allowed to reserve up to')) {
-          windowRetryCount++;
-          log.info('Booking window not open yet - retrying', {
-            jobName: prepared.job.name,
-            retryCount: windowRetryCount,
-            elapsedMs: Date.now() - windowStartTime,
-            maxMs: MAX_WINDOW_RETRY_MS,
-            message: result.message,
-          });
-          await new Promise(resolve => setTimeout(resolve, WINDOW_RETRY_DELAY_MS));
-          continue;
-        }
-
-        // Window is open but court taken - move to phase 2
-        windowOpen = true;
-        log.info('Booking window is open, court taken - trying other courts', {
-          jobName: prepared.job.name,
-          windowRetries: windowRetryCount,
-          elapsedMs: Date.now() - windowStartTime,
-        });
-      }
-
-      // Check if we timed out waiting for window
-      if (!windowOpen && (Date.now() - windowStartTime) >= MAX_WINDOW_RETRY_MS) {
-        log.warn('Booking window still not open after max time', {
-          jobName: prepared.job.name,
-          totalRetries: windowRetryCount,
-          elapsedMs: Date.now() - windowStartTime,
-        });
-        return {
-          jobId: prepared.job.id,
-          status: 'window_closed',
-          attempts,
-          errorMessage: `Booking window not open after ${windowRetryCount} retries (${Math.round((Date.now() - windowStartTime) / 1000)}s)`,
-        };
-      }
-
-      // Phase 2: Window is open - try all courts/slots
+      // Build the full task queue from all pre-fetched court/slot combos
+      const taskQueue: Array<{ timeSlot: string; duration: number; courtId: number }> = [];
       for (const duration of prepared.durations) {
         for (const timeSlot of prepared.timeSlots) {
           const key = `${timeSlot}-${duration}`;
           const courtIds = prepared.courtAvailability.get(key) || [];
-
-          if (courtIds.length === 0) continue;
-
           for (const courtId of courtIds) {
-            // Skip if we already tried this exact combination
-            const alreadyTried = attempts.some(
-              a => a.courtId === courtId && a.timeSlot === timeSlot && a.duration === duration
-            );
-            if (alreadyTried) continue;
-
-            const result = await bookWithForm(timeSlot, duration, courtId);
-
-            attempts.push({
-              date: prepared.targetDate,
-              timeSlot,
-              duration,
-              courtId,
-              success: result.success,
-              message: result.message || (result.success ? 'Booked successfully' : 'Booking failed'),
-              timestamp: new Date(),
-              externalId: result.externalId,
-              confirmationNumber: result.confirmationNumber,
-            });
-
-            if (result.success) {
-              log.info('BOOKING SUCCESS!', {
-                jobName: prepared.job.name,
-                date: prepared.targetDate,
-                timeSlot,
-                duration,
-                courtId,
-                totalAttempts: attempts.length,
-                windowRetries: windowRetryCount,
-                durationMs: Date.now() - jobStartTime,
-              });
-
-              await this.handleSuccessfulBooking(prepared, attempts[attempts.length - 1], result);
-
-              return {
-                jobId: prepared.job.id,
-                status: 'success',
-                attempts,
-                courtId,
-                date: prepared.targetDate,
-                startTime: timeSlot,
-                duration,
-              };
-            }
-            // Court taken - immediately try next court (no delay)
+            taskQueue.push({ timeSlot, duration, courtId });
           }
         }
       }
 
+      if (taskQueue.length === 0) {
+        log.warn('No courts available in pre-fetch', { jobName: prepared.job.name });
+        return {
+          jobId: prepared.job.id,
+          status: 'no_courts',
+          attempts: [],
+        };
+      }
+
+      // Worker pool: 3 workers pulling from shared queue
+      const NUM_WORKERS = 3;
+      let queueIndex = 0; // shared index into taskQueue (only ever incremented)
+      let succeeded = false; // signal workers to stop
+      let successInfo: { timeSlot: string; duration: number; courtId: number; result: Awaited<ReturnType<typeof bookWithForm>> } | null = null;
+      let windowRetryCount = 0;
+      let allWindowClosed = true; // track if every attempt was window_closed
+
+      log.info('Starting worker pool', {
+        jobName: prepared.job.name,
+        totalTasks: taskQueue.length,
+        workers: NUM_WORKERS,
+      });
+
+      const worker = async (workerId: number): Promise<void> => {
+        while (!succeeded) {
+          // Atomically grab next task from queue
+          const idx = queueIndex++;
+          if (idx >= taskQueue.length) break;
+
+          const task = taskQueue[idx];
+          const { timeSlot, duration, courtId } = task;
+
+          log.trace('Worker picking up task', { workerId, idx, timeSlot, duration, courtId });
+
+          // Inner loop: retry THIS task if window is closed, then break to grab next task
+          while (!succeeded) {
+            try {
+              const result = await bookWithForm(timeSlot, duration, courtId);
+
+              attempts.push({
+                date: prepared.targetDate,
+                timeSlot,
+                duration,
+                courtId,
+                success: result.success,
+                message: result.message || (result.success ? 'Booked successfully' : 'Booking failed'),
+                timestamp: new Date(),
+                externalId: result.externalId,
+                confirmationNumber: result.confirmationNumber,
+              });
+
+              if (result.success) {
+                succeeded = true;
+                allWindowClosed = false;
+                successInfo = { timeSlot, duration, courtId, result };
+                log.info('Worker got SUCCESS - signaling others to stop', {
+                  workerId,
+                  timeSlot,
+                  duration,
+                  courtId,
+                  durationMs: Date.now() - jobStartTime,
+                });
+                return;
+              }
+
+              // If window not open yet, retry the SAME task after a short delay
+              if (result.windowClosed || result.message?.includes('only allowed to reserve up to')) {
+                windowRetryCount++;
+                const elapsed = Date.now() - jobStartTime;
+                if (elapsed < MAX_WINDOW_RETRY_MS) {
+                  log.info('Window not open - worker retrying same task', {
+                    workerId,
+                    windowRetryCount,
+                    elapsedMs: elapsed,
+                    message: result.message,
+                  });
+                  await new Promise(resolve => setTimeout(resolve, WINDOW_RETRY_DELAY_MS));
+                  continue; // retry same task in inner loop
+                }
+                break; // timed out waiting for window, move to next task
+              }
+
+              // Court taken or other failure - move to next task
+              allWindowClosed = false;
+              log.trace('Worker task failed, moving to next', {
+                workerId,
+                timeSlot,
+                duration,
+                courtId,
+                message: result.message,
+              });
+              break; // break inner loop, grab next task from queue
+            } catch (error) {
+              allWindowClosed = false;
+              log.warn('Worker task threw error', {
+                workerId,
+                timeSlot,
+                duration,
+                courtId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+              break; // break inner loop, grab next task from queue
+            }
+          }
+        }
+      };
+
+      // Launch all workers and wait for all to finish
+      await Promise.all(
+        Array.from({ length: Math.min(NUM_WORKERS, taskQueue.length) }, (_, i) => worker(i))
+      );
+
+      // Check if we got a success
+      if (succeeded && successInfo) {
+        const { timeSlot, duration, courtId, result } = successInfo;
+        log.info('BOOKING SUCCESS!', {
+          jobName: prepared.job.name,
+          date: prepared.targetDate,
+          timeSlot,
+          duration,
+          courtId,
+          totalAttempts: attempts.length,
+          windowRetries: windowRetryCount,
+          durationMs: Date.now() - jobStartTime,
+        });
+
+        const successAttempt = attempts.find(
+          a => a.courtId === courtId && a.timeSlot === timeSlot && a.duration === duration && a.success
+        )!;
+        await this.handleSuccessfulBooking(prepared, successAttempt, result);
+
+        return {
+          jobId: prepared.job.id,
+          status: 'success' as const,
+          attempts,
+          courtId,
+          date: prepared.targetDate,
+          startTime: timeSlot,
+          duration,
+        };
+      }
+
       // All courts/slots exhausted
+      const finalStatus = allWindowClosed ? 'window_closed' as const : 'no_courts' as const;
       log.warn('All slots failed', {
         jobName: prepared.job.name,
         targetDate: prepared.targetDate,
         totalAttempts: attempts.length,
         windowRetries: windowRetryCount,
+        status: finalStatus,
         durationMs: Date.now() - jobStartTime,
       });
 
       return {
         jobId: prepared.job.id,
-        status: 'no_courts',
+        status: finalStatus,
         attempts,
+        ...(allWindowClosed && {
+          errorMessage: `Booking window not open after ${windowRetryCount} retries (${Math.round((Date.now() - jobStartTime) / 1000)}s)`,
+        }),
       };
     } catch (error) {
       log.error('Job execution error', {
